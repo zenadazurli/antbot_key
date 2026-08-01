@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # bot_antautosurf_complete.py
-# BOT COMPLETO: ProxyFinder → ProxyScrape (100 proxy) → Browser-USE
+# BOT COMPLETO: 100 proxy con rotazione + request dirette
 
 import requests
 import time
 import logging
+import re
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
@@ -115,36 +117,69 @@ PROXYSCRAPE_LIST = [
     "yxgoqj9ooo9c:zbznhcy7jx6kkwq@195.63.31.153:3129"
 ]
 
-# Browser-USE Key (fallback)
-BROWSER_USE_KEY = "bu_vpqaFMR7fG2iGto2Z9oLXXL8M3Fkm25Y87_BwKp2aAU"
+# Account Antautosurf
+ANTA_USER = "luigitaschi@gmail.com"
+ANTA_PASS = "carxzava"
 
 # ============================================================
-# LIVELLO 1: PROXYFINDER
+# ROTAZIONE PROXY
 # ============================================================
 
-def find_proxy():
-    """Cerca proxy con ProxyFinder"""
-    print("🔍 Livello 1: ProxyFinder...")
-    # Implementa qui la logica di ProxyFinder
-    return None  # Se non trova
+class ProxyRotator:
+    """Gestisce la rotazione dei proxy per evitare ripetizioni"""
+    
+    def __init__(self, proxy_list):
+        self.proxies = []
+        for p in proxy_list:
+            parsed = self.parse_proxy(p)
+            if parsed:
+                self.proxies.append(parsed)
+        self.index = 0
+        self.used = set()
+    
+    def parse_proxy(self, proxy_str):
+        try:
+            auth, host = proxy_str.split('@')
+            user, password = auth.split(':')
+            return {
+                'http': f'http://{user}:{password}@{host}',
+                'https': f'http://{user}:{password}@{host}',
+                'host': host
+            }
+        except:
+            return None
+    
+    def get_next(self):
+        """Restituisce il prossimo proxy (round-robin)"""
+        if not self.proxies:
+            return None
+        
+        # Cerca un proxy non usato
+        for i in range(len(self.proxies)):
+            idx = (self.index + i) % len(self.proxies)
+            proxy = self.proxies[idx]
+            host = proxy['host']
+            
+            if host not in self.used:
+                self.index = idx + 1
+                self.used.add(host)
+                return proxy
+        
+        # Se tutti sono usati, resetta
+        self.used.clear()
+        proxy = self.proxies[self.index % len(self.proxies)]
+        self.index += 1
+        return proxy
+    
+    def get_random(self):
+        """Restituisce un proxy casuale"""
+        if not self.proxies:
+            return None
+        return random.choice(self.proxies)
 
 # ============================================================
-# LIVELLO 2: PROXYSCRAPE (100 PROXY)
+# BOT PRINCIPALE
 # ============================================================
-
-def parse_proxy(proxy_str):
-    """Converte la stringa in formato user:pass@host:port"""
-    try:
-        auth, host = proxy_str.split('@')
-        user, password = auth.split(':')
-        return {
-            'http': f'http://{user}:{password}@{host}',
-            'https': f'http://{user}:{password}@{host}',
-            'host': host,
-            'user': user
-        }
-    except:
-        return None
 
 def test_proxy(proxy):
     """Testa un singolo proxy"""
@@ -154,85 +189,96 @@ def test_proxy(proxy):
                         proxies={'http': proxy['http'], 'https': proxy['https']}, 
                         timeout=10)
         if r.status_code == 200:
-            return {
-                'success': True, 
-                'proxy': proxy, 
-                'time': time.time()-start,
-                'ip': r.json().get('origin', 'N/A')
-            }
+            return {'success': True, 'proxy': proxy, 'time': time.time()-start}
     except:
         pass
     return {'success': False}
 
-def get_proxyscrape_proxy():
-    """Trova un proxy funzionante da ProxyScrape (100 proxy)"""
-    print("🔍 Livello 2: ProxyScrape...")
+def get_working_proxy(rotator):
+    """Trova un proxy funzionante con rotazione"""
+    print("🔍 Cerco proxy funzionante...")
     
-    proxies = []
-    for p in PROXYSCRAPE_LIST:
-        parsed = parse_proxy(p)
-        if parsed:
-            proxies.append(parsed)
-    
-    print(f"   📋 {len(proxies)} proxy disponibili")
-    
-    if not proxies:
-        print("   ❌ Nessun proxy disponibile")
-        return None
-    
-    # Test in parallelo (primi 30 per velocità)
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        futures = {executor.submit(test_proxy, p): p for p in proxies[:30]}
+    # Prova i primi 20 proxy
+    for i in range(20):
+        proxy = rotator.get_next()
+        if not proxy:
+            break
         
-        for future in as_completed(futures):
-            result = future.result()
-            if result['success']:
-                print(f"   ✅ Proxy funzionante: {result['proxy']['host']} ({result['time']:.2f}s) - IP: {result['ip']}")
-                return result['proxy']
+        result = test_proxy(proxy)
+        if result['success']:
+            print(f"   ✅ Proxy funzionante: {proxy['host']} ({result['time']:.2f}s)")
+            return proxy
+        
+        print(f"   ❌ Proxy morto: {proxy['host']}")
     
     print("   ❌ Nessun proxy funzionante")
     return None
 
-# ============================================================
-# LIVELLO 3: BROWSER-USE (FALLBACK)
-# ============================================================
-
-def get_csrf_with_browseruse():
-    """Usa Browser-USE per ottenere il CSRF (fallback)"""
-    print("🔍 Livello 3: Browser-USE...")
-    print("   🧪 Browser-USE in esecuzione...")
+def get_csrf_from_antautosurf(proxy):
+    """Ottiene il CSRF da Antautosurf usando il proxy"""
     
-    # Qui va il codice per ottenere CSRF con Browser-USE
-    # Per ora restituisce un token di esempio
-    return "csrf_token_da_browseruse"
-
-# ============================================================
-# BOT PRINCIPALE
-# ============================================================
-
-def get_csrf():
-    """Ottiene il CSRF con i 3 livelli"""
+    print("🌐 Navigo su Antautosurf...")
     
-    # Livello 1: ProxyFinder
-    proxy = find_proxy()
+    session = requests.Session()
     if proxy:
-        print("✅ CSRF ottenuto con ProxyFinder!")
-        return "csrf_from_proxyfinder"
+        session.proxies.update({'http': proxy['http'], 'https': proxy['https']})
     
-    # Livello 2: ProxyScrape (100 proxy)
-    proxy = get_proxyscrape_proxy()
-    if proxy:
-        print("✅ CSRF ottenuto con ProxyScrape!")
-        return "csrf_from_proxyscrape"
+    try:
+        response = session.get("https://antautosurf.com/", timeout=30)
+        print(f"   📡 Status: {response.status_code}")
+        
+        # Cerca il CSRF
+        csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', response.text)
+        if csrf_match:
+            csrf = csrf_match.group(1)
+            print(f"   ✅ CSRF trovato: {csrf}")
+            return csrf, session
+        
+        # Prova login
+        print("   📝 Provo login...")
+        login_data = {"bitcoinwallet": ANTA_USER}
+        response = session.post("https://antautosurf.com/index.php", data=login_data, timeout=30)
+        
+        csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', response.text)
+        if csrf_match:
+            csrf = csrf_match.group(1)
+            print(f"   ✅ CSRF trovato dopo login: {csrf}")
+            return csrf, session
+        
+        return None, session
+        
+    except Exception as e:
+        print(f"   ❌ Errore: {e}")
+        return None, session
+
+def make_direct_request(csrf_token, session):
+    """Fai una request diretta (senza proxy) con il CSRF"""
     
-    # Livello 3: Browser-USE (fallback)
-    csrf = get_csrf_with_browseruse()
-    if csrf:
-        print("✅ CSRF ottenuto con Browser-USE!")
-        return csrf
+    print("\n📡 Request diretta (senza proxy)...")
     
-    print("❌ Nessun metodo funzionante")
-    return None
+    url = "https://antautosurf.com/index.php"
+    params = {
+        "bitcoinwallet": ANTA_USER,
+        "csrf_token": csrf_token
+    }
+    
+    try:
+        # Rimuovi il proxy dalla sessione
+        session.proxies.clear()
+        
+        response = session.get(url, params=params, timeout=30)
+        print(f"   📡 Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            print("   ✅ Request diretta riuscita!")
+            return response.text
+        else:
+            print(f"   ❌ Errore: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"   ❌ Errore: {e}")
+        return None
 
 # ============================================================
 # MAIN
@@ -240,21 +286,41 @@ def get_csrf():
 
 def main():
     print("="*60)
-    print("  🤖 BOT ANTAUTOSURF (3 LIVELLI)")
+    print("  🤖 BOT ANTAUTOSURF (100 PROXY + ROTAZIONE)")
     print("="*60)
-    print("   Livello 1: ProxyFinder")
-    print("   Livello 2: ProxyScrape (100 proxy)")
-    print("   Livello 3: Browser-USE (fallback)")
+    print(f"   Proxy disponibili: {len(PROXYSCRAPE_LIST)}")
+    print(f"   Utente: {ANTA_USER}")
     print("="*60)
     
-    csrf = get_csrf()
+    # Inizializza rotatore proxy
+    rotator = ProxyRotator(PROXYSCRAPE_LIST)
+    print(f"📋 {len(rotator.proxies)} proxy pronti")
     
-    if csrf:
-        print(f"\n🔑 CSRF: {csrf}")
-        print("📝 Ora puoi fare le request dirette!")
+    # 1. Trova proxy funzionante
+    proxy = get_working_proxy(rotator)
+    if not proxy:
+        print("❌ Nessun proxy funzionante")
+        return
+    
+    # 2. Ottieni CSRF con proxy
+    csrf, session = get_csrf_from_antautosurf(proxy)
+    if not csrf:
+        print("❌ Impossibile ottenere CSRF")
+        return
+    
+    print(f"\n🔑 CSRF: {csrf}")
+    
+    # 3. Request diretta (senza proxy)
+    result = make_direct_request(csrf, session)
+    
+    if result:
+        print("\n" + "="*60)
+        print("  🎯 BOT COMPLETATO CON SUCCESSO!")
         print("="*60)
+        print(f"📄 Response: {result[:500]}...")
     else:
-        print("\n❌ Impossibile ottenere CSRF")
+        print("\n" + "="*60)
+        print("  ❌ BOT FALLITO")
         print("="*60)
 
 if __name__ == "__main__":
