@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# bot_antautosurf_complete.py
-# BOT COMPLETO: ProxyScrape (100 proxy) → Browser-USE (fallback) → Request Dirette
+# bot_antautosurf_optimized.py
+# BOT OTTIMIZZATO: ProxyScrape con rotazione intelligente + Browser-USE fallback
 
 import requests
 import time
@@ -9,10 +9,17 @@ import re
 import random
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 
 # ============================================================
 # 🔧 CONFIGURAZIONE
 # ============================================================
+
+ANTA_USER = "luigitaschi@gmail.com"
+ANTA_PASS = "carxzava"
+
+# Browser-USE Key (solo fallback)
+BROWSER_USE_KEY = "bu_vpqaFMR7fG2iGto2Z9oLXXL8M3Fkm25Y87_BwKp2aAU"
 
 # 🔥 100 PROXY DI PROXYSCRAPE
 PROXYSCRAPE_LIST = [
@@ -118,28 +125,25 @@ PROXYSCRAPE_LIST = [
     "yxgoqj9ooo9c:zbznhcy7jx6kkwq@195.63.31.153:3129"
 ]
 
-# Account Antautosurf
-ANTA_USER = "luigitaschi@gmail.com"
-ANTA_PASS = "carxzava"
-
-# Browser-USE API Key (fallback)
-BROWSER_USE_KEY = "bu_vpqaFMR7fG2iGto2Z9oLXXL8M3Fkm25Y87_BwKp2aAU"
-
 # ============================================================
-# ROTAZIONE PROXY
+# ROTAZIONE PROXY INTELLIGENTE
 # ============================================================
 
-class ProxyRotator:
-    """Gestisce la rotazione dei proxy per evitare ripetizioni"""
+class SmartProxyRotator:
+    """Rotazione intelligente con memoria dei proxy falliti"""
     
     def __init__(self, proxy_list):
         self.proxies = []
+        self.failed = set()
+        self.used = set()
+        self.current_index = 0
+        
         for p in proxy_list:
             parsed = self.parse_proxy(p)
             if parsed:
                 self.proxies.append(parsed)
-        self.index = 0
-        self.used = set()
+        
+        self.working_proxies = self.proxies.copy()
     
     def parse_proxy(self, proxy_str):
         try:
@@ -148,35 +152,60 @@ class ProxyRotator:
             return {
                 'http': f'http://{user}:{password}@{host}',
                 'https': f'http://{user}:{password}@{host}',
-                'host': host
+                'host': host,
+                'user': user,
+                'password': password,
+                'str': proxy_str
             }
         except:
             return None
     
     def get_next(self):
-        if not self.proxies:
-            return None
+        """Restituisce il prossimo proxy non fallito"""
+        if not self.working_proxies:
+            # Reset se tutti falliti
+            self.working_proxies = self.proxies.copy()
+            self.failed.clear()
         
-        for i in range(len(self.proxies)):
-            idx = (self.index + i) % len(self.proxies)
-            proxy = self.proxies[idx]
-            host = proxy['host']
+        # Prova a trovare un proxy non usato
+        for i in range(len(self.working_proxies)):
+            idx = (self.current_index + i) % len(self.working_proxies)
+            proxy = self.working_proxies[idx]
             
-            if host not in self.used:
-                self.index = idx + 1
-                self.used.add(host)
+            if proxy['host'] not in self.used and proxy['host'] not in self.failed:
+                self.current_index = idx + 1
+                self.used.add(proxy['host'])
                 return proxy
         
+        # Se tutti usati, resetta
         self.used.clear()
-        proxy = self.proxies[self.index % len(self.proxies)]
-        self.index += 1
+        proxy = self.working_proxies[self.current_index % len(self.working_proxies)]
+        self.current_index += 1
         return proxy
+    
+    def mark_failed(self, proxy):
+        """Marca un proxy come fallito"""
+        if proxy and proxy['host'] not in self.failed:
+            self.failed.add(proxy['host'])
+            self.used.discard(proxy['host'])
+            # Rimuovi dalla lista dei working
+            self.working_proxies = [p for p in self.working_proxies if p['host'] != proxy['host']]
+            print(f"   🚫 Proxy {proxy['host']} marcato come fallito")
+    
+    def get_stats(self):
+        return {
+            'total': len(self.proxies),
+            'working': len(self.working_proxies),
+            'failed': len(self.failed),
+            'used': len(self.used)
+        }
 
 # ============================================================
-# LIVELLO 1: PROXYSCRAPE
+# TEST PROXY
 # ============================================================
 
 def test_proxy(proxy):
+    """Testa un singolo proxy"""
     try:
         start = time.time()
         r = requests.get('http://httpbin.org/ip', 
@@ -189,9 +218,10 @@ def test_proxy(proxy):
     return {'success': False}
 
 def get_working_proxy(rotator):
+    """Trova un proxy funzionante con rotazione intelligente"""
     print("🔍 ProxyScrape: cerco proxy funzionante...")
     
-    for i in range(20):
+    for i in range(30):
         proxy = rotator.get_next()
         if not proxy:
             break
@@ -200,11 +230,16 @@ def get_working_proxy(rotator):
         if result['success']:
             print(f"   ✅ Proxy funzionante: {proxy['host']} ({result['time']:.2f}s)")
             return proxy
-        
-        print(f"   ❌ Proxy morto: {proxy['host']}")
+        else:
+            rotator.mark_failed(proxy)
+            print(f"   ❌ Proxy morto: {proxy['host']}")
     
     print("   ❌ Nessun proxy funzionante")
     return None
+
+# ============================================================
+# OTTIENI CSRF CON PROXY
+# ============================================================
 
 def get_csrf_with_proxy(proxy):
     """Tenta di ottenere CSRF usando il proxy"""
@@ -247,7 +282,7 @@ def get_csrf_with_proxy(proxy):
         return None, session
 
 # ============================================================
-# LIVELLO 2: BROWSER-USE (FALLBACK)
+# BROWSER-USE (FALLBACK)
 # ============================================================
 
 async def get_csrf_with_browseruse_async():
@@ -336,7 +371,7 @@ def get_csrf_with_browseruse():
     return asyncio.run(get_csrf_with_browseruse_async())
 
 # ============================================================
-# REQUEST DIRETTE (SENZA PROXY)
+# REQUEST DIRETTE
 # ============================================================
 
 def make_direct_request(csrf_token, session):
@@ -367,43 +402,47 @@ def make_direct_request(csrf_token, session):
         return None
 
 # ============================================================
-# BOT PRINCIPALE
+# MAIN
 # ============================================================
 
 def main():
     print("="*60)
-    print("  🤖 BOT ANTAUTOSURF COMPLETO")
+    print("  🤖 BOT ANTAUTOSURF OTTIMIZZATO")
     print("="*60)
-    print("   Livello 1: ProxyScrape (100 proxy)")
+    print("   Livello 1: ProxyScrape (rotazione intelligente)")
     print("   Livello 2: Browser-USE (fallback)")
     print("   Request: Dirette (senza proxy)")
     print("="*60)
     print(f"   Utente: {ANTA_USER}")
     print("="*60)
     
-    # Inizializza rotatore proxy
-    rotator = ProxyRotator(PROXYSCRAPE_LIST)
+    # Inizializza rotatore
+    rotator = SmartProxyRotator(PROXYSCRAPE_LIST)
     print(f"📋 {len(rotator.proxies)} proxy pronti")
     
     # ============================================================
-    # LIVELLO 1: PROXYSCRAPE
+    # LIVELLO 1: PROXYSCRAPE CON ROTAZIONE
     # ============================================================
     
     proxy = get_working_proxy(rotator)
     csrf = None
     session = None
+    browser_use_used = False
     
     if proxy:
         csrf, session = get_csrf_with_proxy(proxy)
+        if not csrf:
+            rotator.mark_failed(proxy)
     
     # ============================================================
-    # LIVELLO 2: BROWSER-USE (FALLBACK)
+    # LIVELLO 2: BROWSER-USE (SOLO SE PROXY FALLISCE)
     # ============================================================
     
     if not csrf:
         print("\n" + "="*60)
         print("  ⚠️ PROXY FALLITO, PASSO A BROWSER-USE")
         print("="*60)
+        browser_use_used = True
         csrf = get_csrf_with_browseruse()
     
     # ============================================================
@@ -420,6 +459,21 @@ def main():
         session = requests.Session()
     
     result = make_direct_request(csrf, session)
+    
+    # ============================================================
+    # STATISTICHE FINALI
+    # ============================================================
+    
+    stats = rotator.get_stats()
+    print("\n" + "="*60)
+    print("  📊 STATISTICHE PROXY")
+    print("="*60)
+    print(f"   Proxy totali: {stats['total']}")
+    print(f"   Proxy funzionanti: {stats['working']}")
+    print(f"   Proxy falliti: {stats['failed']}")
+    print(f"   Proxy usati: {stats['used']}")
+    print(f"   Browser-USE usato: {'SI' if browser_use_used else 'NO'}")
+    print("="*60)
     
     if result:
         print("\n" + "="*60)
