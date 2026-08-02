@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-# bot_antautosurf_complete.py
-# BOT COMPLETO: ProxyScrape (100 proxy) → Browser-USE → Start Surf → Loop infinito
+# bot_antautosurf_final.py
+# BOT DEFINITIVO: ProxyFinder (100 proxy) + Auto-Generazione API Key
 
 import asyncio
 import requests
 import time
 import re
+import json
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+import sys
+import os
+from datetime import datetime
 
 # ============================================================
 # 🔧 CONFIGURAZIONE
@@ -16,11 +20,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 ANTA_USER = "luigitaschi@gmail.com"
 ANTA_PASS = "carxzava"
 
-# Browser-USE Key (fallback)
-BROWSER_USE_KEY = "bu_vpqaFMR7fG2iGto2Z9oLXXL8M3Fkm25Y87_BwKp2aAU"
-
 # ============================================================
-# 🔥 100 PROXY AGGIORNATI (GENNAIO 2026)
+# 🔥 100 PROXY PROXYSCRAPE
 # ============================================================
 
 PROXYSCRAPE_LIST = [
@@ -127,21 +128,23 @@ PROXYSCRAPE_LIST = [
 ]
 
 # ============================================================
-# SMART PROXY ROTATOR (MANTIENE LA STESSA LOGICA)
+# PROXY MANAGER CON CACHE DEI FALLITI
 # ============================================================
 
-class SmartProxyRotator:
+class ProxyManager:
     def __init__(self, proxy_list):
         self.proxies = []
-        self.failed = set()
-        self.used = set()
+        self.failed_proxies = set()  # Proxy che hanno fallito su Antautosurf
+        self.blacklisted = set()      # Proxy che hanno già fallito molte volte
         self.current_index = 0
+        self.stats = {'tested': 0, 'working': 0, 'failed': 0}
         
         for p in proxy_list:
             parsed = self.parse_proxy(p)
             if parsed:
                 self.proxies.append(parsed)
-        self.working_proxies = self.proxies.copy()
+        
+        print(f"📋 {len(self.proxies)} proxy caricati")
     
     def parse_proxy(self, proxy_str):
         try:
@@ -152,133 +155,206 @@ class SmartProxyRotator:
                 'https': f'http://{user}:{password}@{host}',
                 'host': host,
                 'user': user,
-                'password': password
+                'password': password,
+                'fail_count': 0
             }
         except:
             return None
     
-    def get_next(self):
-        if not self.working_proxies:
-            self.working_proxies = self.proxies.copy()
-            self.failed.clear()
-        
-        for i in range(len(self.working_proxies)):
-            idx = (self.current_index + i) % len(self.working_proxies)
-            proxy = self.working_proxies[idx]
+    def get_next_proxy(self):
+        """Ottiene il prossimo proxy NON fallito"""
+        # Salta proxy già falliti o blacklistati
+        for i in range(len(self.proxies)):
+            idx = (self.current_index + i) % len(self.proxies)
+            proxy = self.proxies[idx]
             
-            if proxy['host'] not in self.used and proxy['host'] not in self.failed:
-                self.current_index = idx + 1
-                self.used.add(proxy['host'])
+            if proxy['host'] not in self.failed_proxies and proxy['host'] not in self.blacklisted:
+                self.current_index = (idx + 1) % len(self.proxies)
                 return proxy
         
-        self.used.clear()
-        proxy = self.working_proxies[self.current_index % len(self.working_proxies)]
-        self.current_index += 1
-        return proxy
+        # Se tutti sono falliti, resetta
+        print("   🔄 Tutti i proxy falliti, reset...")
+        self.failed_proxies.clear()
+        self.current_index = 0
+        return self.proxies[0] if self.proxies else None
     
-    def mark_failed(self, proxy):
-        if proxy and proxy['host'] not in self.failed:
-            self.failed.add(proxy['host'])
-            self.used.discard(proxy['host'])
-            self.working_proxies = [p for p in self.working_proxies if p['host'] != proxy['host']]
-            print(f"   🚫 Proxy {proxy['host']} marcato come fallito")
+    def mark_failed(self, proxy, reason=""):
+        """Marca un proxy come fallito"""
+        if proxy and proxy['host'] not in self.failed_proxies:
+            self.failed_proxies.add(proxy['host'])
+            self.stats['failed'] += 1
+            print(f"   🚫 Proxy {proxy['host']} fallito: {reason}")
     
-    def get_stats(self):
-        return {
-            'total': len(self.proxies),
-            'working': len(self.working_proxies),
-            'failed': len(self.failed),
-            'used': len(self.used)
-        }
+    def test_proxy(self, proxy):
+        """Testa il proxy su Antautosurf"""
+        try:
+            session = requests.Session()
+            session.proxies.update({'http': proxy['http'], 'https': proxy['https']})
+            session.timeout = 15
+            
+            response = session.get("https://antautosurf.com/", timeout=15)
+            
+            if response.status_code == 200 and ("bitcoinwallet" in response.text or "csrf_token" in response.text):
+                return {'success': True, 'proxy': proxy, 'session': session}
+            else:
+                return {'success': False, 'reason': f'Status {response.status_code}'}
+                
+        except requests.exceptions.ProxyError:
+            return {'success': False, 'reason': 'ProxyError'}
+        except requests.exceptions.ConnectTimeout:
+            return {'success': False, 'reason': 'ConnectTimeout'}
+        except requests.exceptions.ReadTimeout:
+            return {'success': False, 'reason': 'ReadTimeout'}
+        except Exception as e:
+            return {'success': False, 'reason': str(e)[:50]}
+    
+    def find_working_proxy(self, max_tests=30):
+        """Trova un proxy funzionante"""
+        print("🔍 Cerco proxy funzionante su Antautosurf...")
+        
+        tested = 0
+        while tested < max_tests:
+            proxy = self.get_next_proxy()
+            if not proxy:
+                break
+            
+            tested += 1
+            self.stats['tested'] += 1
+            print(f"   🧪 Test {tested}/{max_tests}: {proxy['host']}...", end=" ")
+            
+            result = self.test_proxy(proxy)
+            
+            if result['success']:
+                print("✅ OK!")
+                self.stats['working'] += 1
+                return result['proxy'], result['session']
+            else:
+                print(f"❌ {result.get('reason', 'fallito')}")
+                self.mark_failed(proxy, result.get('reason', ''))
+        
+        print("   ❌ Nessun proxy funzionante trovato")
+        return None, None
 
 # ============================================================
-# TEST PROXY
+# GENERATORE API KEY BROWSER-USE (AUTO)
 # ============================================================
 
-def test_proxy(proxy):
+def genera_nuova_api_key():
+    """Genera una nuova API Key Browser-USE"""
+    print("   🔑 Generazione nuova API Key...")
+    
     try:
-        start = time.time()
-        r = requests.get('http://httpbin.org/ip', 
-                        proxies={'http': proxy['http'], 'https': proxy['https']}, 
-                        timeout=10)
-        if r.status_code == 200:
-            return {'success': True, 'proxy': proxy, 'time': time.time()-start}
-    except:
-        pass
-    return {'success': False}
-
-def get_working_proxy(rotator):
-    print("🔍 ProxyScrape: cerco proxy funzionante...")
-    
-    for i in range(30):
-        proxy = rotator.get_next()
-        if not proxy:
-            break
+        # Esegue lo script di generazione
+        result = subprocess.run(
+            [sys.executable, 'browseruse_full_automation_headless.py', '--headless'],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
         
-        result = test_proxy(proxy)
-        if result['success']:
-            print(f"   ✅ Proxy funzionante: {proxy['host']} ({result['time']:.2f}s)")
-            return proxy
-        else:
-            rotator.mark_failed(proxy)
-            print(f"   ❌ Proxy morto: {proxy['host']}")
-    
-    print("   ❌ Nessun proxy funzionante")
-    return None
-
-# ============================================================
-# OTTIENI CSRF CON PROXY
-# ============================================================
-
-def get_csrf_with_proxy(proxy):
-    print("🌐 Navigo su Antautosurf con proxy...")
-    
-    session = requests.Session()
-    if proxy:
-        session.proxies.update({'http': proxy['http'], 'https': proxy['https']})
-    
-    try:
-        response = session.get("https://antautosurf.com/", timeout=30)
-        print(f"   📡 Status: {response.status_code}")
+        if result.returncode == 0:
+            # Legge il file account.json
+            try:
+                with open('account.json', 'r') as f:
+                    data = json.load(f)
+                    api_key = data.get('api_key')
+                    if api_key:
+                        print(f"   ✅ Nuova API Key generata: {api_key[:20]}...")
+                        return api_key
+            except:
+                pass
         
-        if response.status_code != 200:
-            return None, session
-        
-        csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', response.text)
-        if csrf_match:
-            csrf = csrf_match.group(1)
-            print(f"   ✅ CSRF trovato: {csrf}")
-            return csrf, session
-        
-        print("   📝 Provo login...")
-        login_data = {"bitcoinwallet": ANTA_USER}
-        response = session.post("https://antautosurf.com/index.php", data=login_data, timeout=30)
-        
-        csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', response.text)
-        if csrf_match:
-            csrf = csrf_match.group(1)
-            print(f"   ✅ CSRF trovato dopo login: {csrf}")
-            return csrf, session
-        
-        return None, session
+        print(f"   ❌ Generazione fallita: {result.stderr[:100]}")
+        return None
         
     except Exception as e:
-        print(f"   ❌ Errore: {e}")
-        return None, session
+        print(f"   ❌ Errore generazione: {e}")
+        return None
+
+# ============================================================
+# BROWSER-USE CON ROTAZIONE API KEY
+# ============================================================
+
+class BrowserUseManager:
+    def __init__(self):
+        self.keys = []
+        self.current_key = None
+        self.failed_keys = set()
+        self.keys_file = 'browseruse_keys.json'
+        self.load_keys()
+    
+    def load_keys(self):
+        """Carica le API Key dal file"""
+        try:
+            if os.path.exists(self.keys_file):
+                with open(self.keys_file, 'r') as f:
+                    self.keys = json.load(f)
+                print(f"📂 Caricate {len(self.keys)} API Key")
+            else:
+                print("📂 Nessuna API Key salvata")
+                self.keys = []
+        except:
+            self.keys = []
+    
+    def save_keys(self):
+        """Salva le API Key"""
+        try:
+            with open(self.keys_file, 'w') as f:
+                json.dump(self.keys, f, indent=2)
+        except:
+            pass
+    
+    def add_key(self, api_key):
+        """Aggiunge una nuova API Key"""
+        if api_key not in self.keys:
+            self.keys.append(api_key)
+            self.save_keys()
+            return True
+        return False
+    
+    def get_next_key(self):
+        """Ottiene la prossima API Key disponibile"""
+        if not self.keys:
+            print("   🔑 Genero nuova API Key (pool vuoto)...")
+            new_key = genera_nuova_api_key()
+            if new_key:
+                self.add_key(new_key)
+                return new_key
+            return None
+        
+        for key in self.keys:
+            if key not in self.failed_keys:
+                self.current_key = key
+                return key
+        
+        # Tutte le key fallite, proviamo a generarne una nuova
+        print("   🔑 Tutte le key fallite, genero nuova...")
+        new_key = genera_nuova_api_key()
+        if new_key:
+            self.add_key(new_key)
+            return new_key
+        
+        return None
+    
+    def mark_failed(self, key):
+        """Marca una key come fallita"""
+        if key and key not in self.failed_keys:
+            self.failed_keys.add(key)
+            print(f"   🚫 API Key {key[:20]}... fallita")
 
 # ============================================================
 # BROWSER-USE FALLBACK
 # ============================================================
 
-async def get_csrf_with_browseruse_async():
-    print("🔍 Browser-USE: fallback attivato...")
-    print("   🧪 Avvio Browser-USE...")
+async def get_csrf_with_browseruse_async(api_key, anta_user, anta_pass):
+    """Ottiene CSRF usando Browser-USE"""
+    print(f"   🧪 Browser-USE: {api_key[:20]}...")
     
     try:
         from browser_use_sdk.v3 import AsyncBrowserUse
         from playwright.async_api import async_playwright
         
-        client = AsyncBrowserUse(api_key=BROWSER_USE_KEY)
+        client = AsyncBrowserUse(api_key=api_key)
         browser = await client.browsers.create()
         
         async with async_playwright() as p:
@@ -286,19 +362,16 @@ async def get_csrf_with_browseruse_async():
             context = pw_browser.contexts[0]
             page = context.pages[0]
             
-            print("   🌐 Apro Antautosurf...")
             await page.goto("https://antautosurf.com/")
             await page.wait_for_load_state("networkidle")
             
             email_input = await page.query_selector('input[name="bitcoinwallet"]')
             if email_input:
-                await email_input.fill(ANTA_USER)
-                print("   ✅ Email inserita")
+                await email_input.fill(anta_user)
             
             enter_btn = await page.wait_for_selector('input[value*="Enter"]', timeout=30000)
             if enter_btn:
                 await enter_btn.click()
-                print("   ✅ Cliccato su Enter")
             
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
@@ -306,13 +379,11 @@ async def get_csrf_with_browseruse_async():
             if "Please enter Password" in await page.content():
                 pass_input = await page.query_selector('input[name="password"]')
                 if pass_input:
-                    await pass_input.fill(ANTA_PASS)
-                    print("   ✅ Password inserita")
+                    await pass_input.fill(anta_pass)
                 
                 enter_btn = await page.query_selector('input[value="Enter"]')
                 if enter_btn:
                     await enter_btn.click()
-                    print("   ✅ Cliccato su Enter")
                 
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(2)
@@ -321,13 +392,11 @@ async def get_csrf_with_browseruse_async():
                 captcha_btn = await page.query_selector('a[href*="cid="]')
                 if captcha_btn:
                     await captcha_btn.click()
-                    print("   ✅ Captcha risolto")
                 
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(2)
             
-            # 🚀 CLICCA SU START SURF
-            print("   🚀 Clicco su Start Surf...")
+            # Start Surf
             try:
                 start_btn = await page.wait_for_selector(
                     '#button1, input[value*="Start Surf"], .submit3', 
@@ -335,18 +404,16 @@ async def get_csrf_with_browseruse_async():
                 )
                 if start_btn:
                     await start_btn.click()
-                    print("   ✅ Start Surf cliccato!")
                     await asyncio.sleep(3)
-                    print("   ⏱️ Timer partito!")
-            except Exception as e:
-                print(f"   ⚠️ Errore Start Surf: {e}")
+            except:
+                pass
             
             html = await page.content()
             csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', html)
             
             if csrf_match:
                 csrf = csrf_match.group(1)
-                print(f"   ✅ CSRF trovato con Browser-USE: {csrf}")
+                print(f"   ✅ CSRF: {csrf}")
                 await pw_browser.close()
                 await client.browsers.stop(browser.id)
                 return csrf
@@ -356,105 +423,139 @@ async def get_csrf_with_browseruse_async():
             return None
             
     except Exception as e:
-        print(f"   ❌ Browser-USE fallito: {e}")
-        return None
-
-def get_csrf_with_browseruse():
-    return asyncio.run(get_csrf_with_browseruse_async())
-
-# ============================================================
-# REQUEST DIRETTA
-# ============================================================
-
-def make_direct_request(csrf_token, session):
-    print("\n📡 Request diretta (senza proxy)...")
-    
-    url = "https://antautosurf.com/index.php"
-    params = {
-        "bitcoinwallet": ANTA_USER,
-        "csrf_token": csrf_token
-    }
-    
-    try:
-        session.proxies.clear()
-        response = session.get(url, params=params, timeout=30)
-        print(f"   📡 Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            print("   ✅ Request diretta riuscita!")
-            return response.text
+        error_msg = str(e)
+        if "402" in error_msg or "credits" in error_msg.lower() or "balance" in error_msg.lower():
+            print(f"   💰 Saldo esaurito per key {api_key[:20]}...")
+            return "NO_CREDITS"
         else:
-            print(f"   ❌ Errore: {response.status_code}")
+            print(f"   ❌ Errore: {error_msg[:80]}")
             return None
-            
+
+def get_csrf_with_browseruse(api_key, anta_user, anta_pass):
+    """Wrapper sincrono per Browser-USE"""
+    result = asyncio.run(get_csrf_with_browseruse_async(api_key, anta_user, anta_pass))
+    
+    # Se "NO_CREDITS", marcalo come fallito
+    if result == "NO_CREDITS":
+        return None
+    return result
+
+# ============================================================
+# OTTIENI CSRF
+# ============================================================
+
+def get_csrf_with_proxy(proxy, session, anta_user):
+    """Ottiene CSRF usando il proxy"""
+    try:
+        response = session.get("https://antautosurf.com/", timeout=30)
+        
+        if response.status_code != 200:
+            return None
+        
+        csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', response.text)
+        if csrf_match:
+            return csrf_match.group(1)
+        
+        # Prova login
+        login_data = {"bitcoinwallet": anta_user}
+        response = session.post("https://antautosurf.com/index.php", data=login_data, timeout=30)
+        
+        csrf_match = re.search(r'csrf_token["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_\-]+)', response.text)
+        if csrf_match:
+            return csrf_match.group(1)
+        
+        return None
+        
     except Exception as e:
-        print(f"   ❌ Errore: {e}")
         return None
 
 # ============================================================
-# SINGOLA SESSIONE
+# MAIN SESSIONE
 # ============================================================
 
 def esegui_sessione():
-    """Esegue una singola sessione del bot"""
+    """Esegue una sessione del bot"""
     
     print("\n" + "="*60)
-    print("  🤖 BOT ANTAUTOSURF - SESSIONE")
-    print("="*60)
-    print(f"   Utente: {ANTA_USER}")
+    print(f"  🤖 SESSIONE - {datetime.now().strftime('%H:%M:%S')}")
     print("="*60)
     
-    rotator = SmartProxyRotator(PROXYSCRAPE_LIST)
-    print(f"📋 {len(rotator.proxies)} proxy pronti")
-    
-    proxy = get_working_proxy(rotator)
+    # 1. PROXY
+    proxy_manager = ProxyManager(PROXYSCRAPE_LIST)
+    proxy, session = proxy_manager.find_working_proxy(max_tests=30)
     csrf = None
-    session = None
     browser_use_used = False
+    browser_manager = BrowserUseManager()
     
-    if proxy:
-        csrf, session = get_csrf_with_proxy(proxy)
+    if proxy and session:
+        csrf = get_csrf_with_proxy(proxy, session, ANTA_USER)
         if not csrf:
-            rotator.mark_failed(proxy)
+            proxy_manager.mark_failed(proxy, "CSRF non trovato")
     
+    # 2. BROWSER-USE FALLBACK
     if not csrf:
         print("\n" + "="*60)
         print("  ⚠️ PROXY FALLITO, PASSO A BROWSER-USE")
         print("="*60)
-        browser_use_used = True
-        csrf = get_csrf_with_browseruse()
+        
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            api_key = browser_manager.get_next_key()
+            if not api_key:
+                print("   ❌ Nessuna API Key disponibile")
+                break
+            
+            browser_use_used = True
+            print(f"\n   🔑 Tentativo {attempt+1}/{max_attempts}")
+            csrf = get_csrf_with_browseruse(api_key, ANTA_USER, ANTA_PASS)
+            
+            if csrf:
+                print(f"   ✅ Browser-USE OK con key: {api_key[:20]}...")
+                break
+            else:
+                browser_manager.mark_failed(api_key)
+                print(f"   ⚠️ Tentativo {attempt+1} fallito")
+                time.sleep(3)
     
     if not csrf:
         print("\n❌ Impossibile ottenere CSRF")
         return False
     
+    # 3. REQUEST DIRETTA
     print(f"\n🔑 CSRF: {csrf}")
     
     if not session:
         session = requests.Session()
     
-    result = make_direct_request(csrf, session)
-    
-    stats = rotator.get_stats()
-    print("\n" + "="*60)
-    print("  📊 STATISTICHE PROXY")
-    print("="*60)
-    print(f"   Proxy totali: {stats['total']}")
-    print(f"   Proxy funzionanti: {stats['working']}")
-    print(f"   Proxy falliti: {stats['failed']}")
-    print(f"   Proxy usati: {stats['used']}")
-    print(f"   Browser-USE usato: {'SI' if browser_use_used else 'NO'}")
-    print("="*60)
-    
-    if result:
-        print("\n" + "="*60)
-        print("  🎯 SESSIONE COMPLETATA CON SUCCESSO!")
-        print("="*60)
-        return True
-    else:
-        print("\n" + "="*60)
-        print("  ❌ SESSIONE FALLITA")
-        print("="*60)
+    try:
+        session.proxies.clear()
+        response = session.get(
+            "https://antautosurf.com/index.php",
+            params={"bitcoinwallet": ANTA_USER, "csrf_token": csrf},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            print("   ✅ Request diretta riuscita!")
+            print("\n" + "="*60)
+            print("  🎯 SESSIONE COMPLETATA!")
+            print("="*60)
+            
+            # Statistiche
+            print(f"\n📊 STATISTICHE:")
+            print(f"   Proxy testati: {proxy_manager.stats['tested']}")
+            print(f"   Proxy funzionanti: {proxy_manager.stats['working']}")
+            print(f"   Proxy falliti: {proxy_manager.stats['failed']}")
+            print(f"   Browser-USE usato: {'SI' if browser_use_used else 'NO'}")
+            print(f"   API Key disponibili: {len(browser_manager.keys)}")
+            print("="*60)
+            return True
+        else:
+            print(f"   ❌ Errore: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"   ❌ Errore: {e}")
         return False
 
 # ============================================================
@@ -463,13 +564,13 @@ def esegui_sessione():
 
 def main():
     print("="*60)
-    print("  🤖 BOT ANTAUTOSURF (LOOP INFINITO)")
+    print("  🤖 BOT ANTAUTOSURF FINALE")
     print("="*60)
-    print("   Livello 1: ProxyScrape (100 proxy, rotazione intelligente)")
-    print("   Livello 2: Browser-USE (fallback)")
-    print("   Request: Dirette (senza proxy)")
-    print("   🚀 Start Surf: ATTIVO (guadagna punti!)")
-    print("   Modalità: Continuo (loop infinito)")
+    print(f"   📧 Account: {ANTA_USER}")
+    print(f"   🌐 Proxy: {len(PROXYSCRAPE_LIST)} proxy")
+    print(f"   🔑 Browser-USE: Auto-generazione")
+    print("   🚀 Start Surf: ATTIVO")
+    print("   ♾️ Modalità: Continuo")
     print("="*60)
     
     ciclo = 0
@@ -483,19 +584,17 @@ def main():
             successo = esegui_sessione()
             
             if successo:
-                print("\n⏳ Attesa 60 secondi prima del prossimo ciclo...")
+                print("\n⏳ Attesa 60 secondi...")
                 time.sleep(60)
             else:
-                print("\n⏳ Attesa 30 secondi prima di riprovare...")
+                print("\n⏳ Attesa 30 secondi...")
                 time.sleep(30)
                 
         except KeyboardInterrupt:
-            print("\n🛑 Bot fermato dall'utente")
+            print("\n🛑 Fermato")
             break
-            
         except Exception as e:
-            print(f"\n❌ Errore nel ciclo: {e}")
-            print("⏳ Attesa 30 secondi prima di riprovare...")
+            print(f"\n❌ Errore: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":
